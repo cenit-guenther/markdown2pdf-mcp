@@ -1,18 +1,24 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
   Request,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import { randomUUID } from 'crypto';
+import { storePdf, retrievePdf } from './pdfStore.js';
 const require = createRequire(import.meta.url);
 const pkg = require('../package.json');
 const hljs = require('highlight.js');
@@ -35,14 +41,12 @@ export class MarkdownPdfServer {
       },
       {
         capabilities: {
-          tools: {
-            create_pdf_from_markdown: true
-          },
+          tools: {},
         },
       }
     );
 
-    this.setupToolHandlers();
+    this.setupToolHandlers(this.server);
 
     // Set up error handler first to ensure it's available for all operations
     this.server.onerror = (error: Error): never => {
@@ -92,8 +96,8 @@ export class MarkdownPdfServer {
     process.once('SIGTERM', () => handleShutdown('SIGTERM').catch(() => process.exit(1)));
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  private setupToolHandlers(server: Server) {
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
           name: 'create_pdf_from_markdown',
@@ -151,7 +155,7 @@ export class MarkdownPdfServer {
       ],
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name !== 'create_pdf_from_markdown') {
         throw new McpError(
           ErrorCode.MethodNotFound,
@@ -177,8 +181,10 @@ export class MarkdownPdfServer {
         showPageNumbers?: boolean;
       };
 
-      // Get output directory from environment variable, outputFilename path, or default to user's home
-      const outputDir = (() => {
+      const isHttpMode = process.env.MCP_TRANSPORT === 'http';
+
+      // Get output directory: in HTTP mode use a temp dir; in stdio mode use env/path/home
+      const outputDir = isHttpMode ? os.tmpdir() : (() => {
         if (process.env.M2P_OUTPUT_DIR) {
           return path.resolve(process.env.M2P_OUTPUT_DIR);
         }
@@ -303,6 +309,26 @@ export class MarkdownPdfServer {
 
         // Ensure absolute path is returned
         const absolutePath = path.resolve(outputPath);
+
+        if (isHttpMode) {
+          // Read PDF into memory, store ephemerally, return download URL
+          const pdfBuffer = await fs.promises.readFile(absolutePath);
+          const safeFilename = path.basename(absolutePath);
+          const id = storePdf(pdfBuffer, safeFilename);
+          await fs.promises.unlink(absolutePath).catch(() => {});
+          const baseUrl = process.env.MCP_BASE_URL ??
+            `http://localhost:${process.env.MCP_PORT ?? '3000'}`;
+          const downloadUrl = `${baseUrl}/pdf/${id}`;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `PDF created successfully.\nDownload URL: ${downloadUrl}`
+              },
+            ],
+          };
+        }
+
         progressUpdates.push(`PDF file created successfully at: ${absolutePath}`);
         progressUpdates.push(`File exists: ${fs.existsSync(absolutePath)}`);
 
@@ -545,7 +571,119 @@ export class MarkdownPdfServer {
   private transport: StdioServerTransport | null = null;
   private isRunning: boolean = false;
 
+  private createMcpServer(): Server {
+    const server = new Server(
+      { name: 'markdown2pdf', version: pkg.version },
+      { capabilities: { tools: {} } }
+    );
+    this.setupToolHandlers(server);
+    server.onerror = (error: Error): never => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Server error: ${error.message}`,
+        { details: { name: error.name, stack: error.stack } }
+      );
+    };
+    return server;
+  }
+
+  public async runHttp(): Promise<void> {
+    const port = parseInt(process.env.MCP_PORT ?? '3000', 10);
+    const app = createMcpExpressApp();
+    const transports = new Map<string, StreamableHTTPServerTransport | SSEServerTransport>();
+
+    // Streamable HTTP endpoint (protocol version 2025-11-25)
+    app.all('/mcp', async (req: any, res: any) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        let transport: StreamableHTTPServerTransport;
+
+        if (sessionId && transports.has(sessionId)) {
+          const existing = transports.get(sessionId)!;
+          if (!(existing instanceof StreamableHTTPServerTransport)) {
+            res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Session uses a different transport protocol' }, id: null });
+            return;
+          }
+          transport = existing;
+        } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid: string) => {
+              transports.set(sid, transport);
+            },
+          });
+          transport.onclose = () => {
+            if (transport.sessionId) transports.delete(transport.sessionId);
+          };
+          await this.createMcpServer().connect(transport);
+        } else {
+          res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID or not an initialization request' }, id: null });
+          return;
+        }
+
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        console.error('[markdown2pdf] Error handling /mcp request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+        }
+      }
+    });
+
+    // Legacy SSE endpoint (protocol version 2024-11-05)
+    app.get('/sse', async (req: any, res: any) => {
+      try {
+        const transport = new SSEServerTransport('/messages', res);
+        transports.set(transport.sessionId, transport);
+        res.on('close', () => { transports.delete(transport.sessionId); });
+        await this.createMcpServer().connect(transport);
+      } catch (error) {
+        console.error('[markdown2pdf] Error handling /sse request:', error);
+      }
+    });
+
+    app.post('/messages', async (req: any, res: any) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = transports.get(sessionId);
+      if (transport instanceof SSEServerTransport) {
+        await transport.handlePostMessage(req, res, req.body);
+      } else {
+        res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'No SSE transport found for sessionId' }, id: null });
+      }
+    });
+
+    // PDF download endpoint
+    app.get('/pdf/:id', (req: any, res: any) => {
+      const entry = retrievePdf(req.params.id);
+      if (!entry) {
+        res.status(404).json({ error: 'PDF not found or expired' });
+        return;
+      }
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${entry.filename}"`);
+      res.send(entry.buffer);
+    });
+
+    await new Promise<void>((resolve) => {
+      const httpServer = app.listen(port, () => {
+        console.error(`[markdown2pdf] HTTP server listening on port ${port}`);
+        console.error(`[markdown2pdf] StreamableHTTP: POST /mcp | Legacy SSE: GET /sse | Download: GET /pdf/:id`);
+      });
+
+      const shutdown = () => { httpServer.close(() => resolve()); };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+    });
+  }
+
   public async run(): Promise<void> {
+    if (process.env.MCP_TRANSPORT === 'http') {
+      return this.runHttp();
+    }
+    return this.runStdio();
+  }
+
+  public async runStdio(): Promise<void> {
     if (this.isRunning) {
       return;
     }
