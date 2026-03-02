@@ -16,7 +16,7 @@ function getPlatformPath() {
       : `mac-${CHROME_VERSION}/chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
   }
   if (platform === 'linux') {
-    return `linux-${CHROME_VERSION}/chrome-linux/chrome`;
+    return `linux-${CHROME_VERSION}/chrome-linux64/chrome`;
   }
   if (platform === 'win32') {
     return `win64-${CHROME_VERSION}/chrome-win/chrome.exe`;
@@ -95,16 +95,18 @@ async function renderPDF({
     });
   }
   
+  let browserDisconnectError = null;
+
   try {
     const page = await browser.newPage();
 
-    // Monitor browser crashes
+    // Monitor browser crashes — store error instead of throwing to avoid crashing the server process
     browser.on('disconnected', () => {
-      throw new Error('Browser disconnected unexpectedly. This may indicate an out-of-memory issue or browser crash. Try reducing content size or increasing system resources.');
+      browserDisconnectError = new Error('Browser disconnected unexpectedly. This may indicate an out-of-memory issue or browser crash. Try reducing content size or increasing system resources.');
     });
 
     page.on('error', err => {
-      throw new Error(`Page crashed: ${err.message}`);
+      browserDisconnectError = new Error(`Page crashed: ${err.message}`);
     });
 
     page.on('pageerror', err => {
@@ -134,6 +136,8 @@ async function renderPDF({
       }
       throw new Error(`Failed to load HTML content: ${err.message}`);
     });
+
+    if (browserDisconnectError) throw browserDisconnectError;
 
     if (verbose) {
       console.error(`[markdown2pdf] HTML loaded successfully`);
@@ -197,6 +201,8 @@ async function renderPDF({
     const shouldDisplayHeaderFooter = Boolean(
       showPageNumbers || (watermarkText && watermarkScope === 'all-pages')
     );
+
+    if (browserDisconnectError) throw browserDisconnectError;
 
     await page.pdf({
       path: pdfPath,
